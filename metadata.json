@@ -1,0 +1,6 @@
+{
+  "name": "SHADOW AI - Native Android & 3D Hologram",
+  "description": "Cinematic white energy core hologram and native Android Kotlin project for SHADOW AI with Gemini intelligence, optimized for Samsung Galaxy F55.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

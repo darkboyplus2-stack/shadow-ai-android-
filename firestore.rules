@@ -1,0 +1,120 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Reusable Security Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Memory Entity Validation
+    function isValidMemory(data) {
+      return data.keys().hasAll(['id', 'userId', 'content', 'category', 'provenance', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'userId', 'content', 'category', 'tags', 'provenance', 'confidence', 'createdAt', 'updatedAt']) &&
+             data.id is string && isValidId(data.id) &&
+             data.userId is string && data.userId == request.auth.uid &&
+             data.content is string && data.content.size() >= 1 && data.content.size() <= 1000 &&
+             data.category is string && data.category in ['preference', 'project', 'instruction', 'constraint', 'fact'] &&
+             data.provenance is string && data.provenance in ['explicit_user', 'implicit_inference'] &&
+             (!('tags' in data) || (data.tags is list && data.tags.size() <= 20)) &&
+             (!('confidence' in data) || (data.confidence is number && data.confidence >= 0.0 && data.confidence <= 1.0)) &&
+             data.createdAt is string && data.createdAt.size() <= 64 &&
+             data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    // ChatSession Entity Validation
+    function isValidChatSession(data) {
+      return data.keys().hasAll(['id', 'userId', 'title', 'messages', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'userId', 'title', 'messages', 'updatedAt', 'createdAt']) &&
+             data.id is string && isValidId(data.id) &&
+             data.userId is string && data.userId == request.auth.uid &&
+             data.title is string && data.title.size() <= 200 &&
+             data.messages is list && data.messages.size() <= 500 &&
+             data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    // UserSettings Entity Validation
+    function isValidUserSettings(data) {
+      return data.keys().hasAll(['userId', 'autoMemoryEnabled', 'updatedAt']) &&
+             data.keys().hasOnly(['userId', 'autoMemoryEnabled', 'speechOutputEnabled', 'ttsVoice', 'intelligenceMode', 'personalityArchetype', 'updatedAt']) &&
+             data.userId is string && data.userId == request.auth.uid &&
+             data.autoMemoryEnabled is bool &&
+             (!('speechOutputEnabled' in data) || data.speechOutputEnabled is bool) &&
+             (!('ttsVoice' in data) || (data.ttsVoice is string && data.ttsVoice.size() <= 64)) &&
+             (!('intelligenceMode' in data) || (data.intelligenceMode is string && data.intelligenceMode.size() <= 64)) &&
+             (!('personalityArchetype' in data) || (data.personalityArchetype is string && data.personalityArchetype.size() <= 64)) &&
+             data.updatedAt is string && data.updatedAt.size() <= 64;
+    }
+
+    // User Memories Collection
+    match /users/{userId}/memories/{memoryId} {
+      allow get: if isOwner(userId) && isValidId(memoryId);
+      allow list: if isOwner(userId);
+      allow create: if isOwner(userId) &&
+                       isValidId(memoryId) &&
+                       isValidMemory(incoming()) &&
+                       incoming().id == memoryId &&
+                       incoming().userId == userId;
+      allow update: if isOwner(userId) &&
+                       isValidId(memoryId) &&
+                       isValidMemory(incoming()) &&
+                       incoming().userId == existing().userId &&
+                       incoming().id == existing().id &&
+                       incoming().createdAt == existing().createdAt;
+      allow delete: if isOwner(userId) && isValidId(memoryId);
+    }
+
+    // User Chat Sessions Collection
+    match /users/{userId}/chats/{chatId} {
+      allow get: if isOwner(userId) && isValidId(chatId);
+      allow list: if isOwner(userId);
+      allow create: if isOwner(userId) &&
+                       isValidId(chatId) &&
+                       isValidChatSession(incoming()) &&
+                       incoming().id == chatId &&
+                       incoming().userId == userId;
+      allow update: if isOwner(userId) &&
+                       isValidId(chatId) &&
+                       isValidChatSession(incoming()) &&
+                       incoming().userId == existing().userId &&
+                       incoming().id == existing().id;
+      allow delete: if isOwner(userId) && isValidId(chatId);
+    }
+
+    // User Settings Document
+    match /users/{userId}/settings/{settingId} {
+      allow get: if isOwner(userId) && isValidId(settingId);
+      allow list: if isOwner(userId);
+      allow create: if isOwner(userId) &&
+                       isValidId(settingId) &&
+                       isValidUserSettings(incoming()) &&
+                       incoming().userId == userId;
+      allow update: if isOwner(userId) &&
+                       isValidId(settingId) &&
+                       isValidUserSettings(incoming()) &&
+                       incoming().userId == existing().userId;
+      allow delete: if isOwner(userId) && isValidId(settingId);
+    }
+  }
+}

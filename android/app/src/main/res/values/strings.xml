@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SHADOW AI</string>
+    <string name="hologram_desc">Interactive 3D Geometric Hologram</string>
+    <string name="state_idle">IDLE</string>
+    <string name="state_listening">LISTENING</string>
+    <string name="state_thinking">THINKING</string>
+    <string name="state_speaking">SPEAKING</string>
+    <string name="chat_placeholder">Ask Shadow anything…</string>
+    <string name="send">Send</string>
+    <string name="mic_not_ready">Voice engine integration scheduled for Milestone 2</string>
+    <string name="chat_not_ready">AI text backend connecting in next milestone</string>
+    <string name="reset_view">Reset View</string>
+    <string name="settings">Settings</string>
+</resources>

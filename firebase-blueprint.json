@@ -1,0 +1,145 @@
+{
+  "entities": {
+    "Memory": {
+      "title": "Memory",
+      "description": "A discrete long-term memory or learned preference belonging to a user",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique identifier for the memory record"
+        },
+        "userId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner user UID"
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "description": "Concise factual memory or preference statement"
+        },
+        "category": {
+          "type": "string",
+          "enum": ["preference", "project", "instruction", "constraint", "fact"],
+          "description": "Semantic memory category"
+        },
+        "tags": {
+          "type": "array",
+          "description": "Keywords used for fast contextual retrieval"
+        },
+        "provenance": {
+          "type": "string",
+          "enum": ["explicit_user", "implicit_inference"],
+          "description": "Origin of the memory"
+        },
+        "confidence": {
+          "type": "number",
+          "description": "Confidence score between 0.0 and 1.0"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp in ISO-8601 format"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Last update timestamp in ISO-8601 format"
+        }
+      },
+      "required": ["id", "userId", "content", "category", "provenance", "createdAt", "updatedAt"]
+    },
+    "ChatSession": {
+      "title": "ChatSession",
+      "description": "A conversation history session for a user",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique identifier for the chat session"
+        },
+        "userId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner user UID"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Title or summary of conversation"
+        },
+        "messages": {
+          "type": "array",
+          "description": "List of chat messages in this session"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Last activity timestamp"
+        }
+      },
+      "required": ["id", "userId", "title", "messages", "updatedAt"]
+    },
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "User preferences and runtime configuration",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner user UID"
+        },
+        "autoMemoryEnabled": {
+          "type": "boolean",
+          "description": "Whether SHADOW automatically extracts background memories"
+        },
+        "speechOutputEnabled": {
+          "type": "boolean",
+          "description": "Whether spoken voice output is enabled"
+        },
+        "ttsVoice": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Preferred TTS voice"
+        },
+        "intelligenceMode": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Active intelligence mode (e.g., standard, deep-thought)"
+        },
+        "personalityArchetype": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Selected personality archetype"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Last modified timestamp"
+        }
+      },
+      "required": ["userId", "autoMemoryEnabled", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/memories/{memoryId}": {
+      "schema": {
+        "$ref": "#/entities/Memory"
+      },
+      "description": "Private collection of long-term memories for an authenticated user"
+    },
+    "/users/{userId}/chats/{chatId}": {
+      "schema": {
+        "$ref": "#/entities/ChatSession"
+      },
+      "description": "Private conversation sessions for an authenticated user"
+    },
+    "/users/{userId}/settings/{settingId}": {
+      "schema": {
+        "$ref": "#/entities/UserSettings"
+      },
+      "description": "Private settings document for an authenticated user"
+    }
+  }
+}

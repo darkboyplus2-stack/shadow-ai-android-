@@ -1,0 +1,38 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Circular Glowing Yellow Energy Planet Core & Rings -->
+    <!-- Outer tilted orbital ring -->
+    <path
+        android:strokeColor="#D97706"
+        android:strokeWidth="2.5"
+        android:pathData="M18,60 C26,40 82,24 90,48 C98,72 42,88 18,60 Z" />
+
+    <!-- Inner tilted orbital ring -->
+    <path
+        android:strokeColor="#F59E0B"
+        android:strokeWidth="2.0"
+        android:pathData="M24,46 C32,28 76,40 84,62 C92,84 48,72 24,46 Z" />
+
+    <!-- Corona atmosphere glow -->
+    <path
+        android:fillColor="#78350F"
+        android:pathData="M54,54 m-28,0 a28,28 0 1,0 56,0 a28,28 0 1,0 -56,0" />
+
+    <!-- Spherical Energy Planet Mantle -->
+    <path
+        android:fillColor="#F59E0B"
+        android:pathData="M54,54 m-22,0 a22,22 0 1,0 44,0 a22,22 0 1,0 -44,0" />
+
+    <!-- Solar core highlight -->
+    <path
+        android:fillColor="#FEF08A"
+        android:pathData="M54,54 m-13,0 a13,13 0 1,0 26,0 a13,13 0 1,0 -26,0" />
+
+    <!-- Brightest radiant center -->
+    <path
+        android:fillColor="#FFFBEB"
+        android:pathData="M54,54 m-6,0 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0" />
+</vector>

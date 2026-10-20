@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF050507</color>
+    <color name="surface_dark">#FF0D0D12</color>
+    <color name="amber_primary">#FFF59E0B</color>
+    <color name="amber_secondary">#FFD97706</color>
+    <color name="amber_light">#FFFEF08A</color>
+    <color name="amber_dark">#FF78350F</color>
+    <color name="text_primary">#FFF3F4F6</color>
+    <color name="text_muted">#FF9CA3AF</color>
+</resources>
