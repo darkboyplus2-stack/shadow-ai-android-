@@ -337,12 +337,11 @@ export function validateChatPayload(req: Request, res: Response, next: NextFunct
       res.status(400).json({ error: 'Field "history" must be an array of message turns.', code: 'INVALID_PAYLOAD', status: 400 });
       return;
     }
-    if (history.length > 30) {
-      res.status(400).json({ error: 'Conversation history exceeds maximum of 30 turns.', code: 'INVALID_PAYLOAD', status: 400 });
-      return;
-    }
-    for (let i = 0; i < history.length; i++) {
-      const turn = history[i];
+    // Gracefully cap conversation history to the latest 60 turns rather than rejecting long conversations with HTTP 400
+    const effectiveHistory = history.length > 60 ? history.slice(-60) : history;
+    req.body.history = effectiveHistory;
+    for (let i = 0; i < effectiveHistory.length; i++) {
+      const turn = effectiveHistory[i];
       if (!turn || typeof turn !== 'object' || !turn.role || !Array.isArray(turn.parts)) {
         res.status(400).json({ error: `History item at index ${i} is malformed.`, code: 'INVALID_PAYLOAD', status: 400 });
         return;

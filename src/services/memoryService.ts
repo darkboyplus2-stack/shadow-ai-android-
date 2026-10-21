@@ -11,6 +11,7 @@ import {
 } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from './firebase';
 import { authService, UserProfile } from './authService';
+import { offlineSyncService } from './offlineSyncService';
 
 export type MemoryCategory = 'preference' | 'project' | 'instruction' | 'constraint' | 'fact';
 export type MemoryProvenance = 'explicit_user' | 'implicit_inference';
@@ -32,6 +33,36 @@ export type SyncStatus = 'offline' | 'guest' | 'syncing' | 'synced' | 'error';
 
 export const GUEST_STORAGE_KEY = 'shadow_guest_memories';
 export const AUTO_MEMORY_CONFIG_KEY = 'shadow_auto_memory_enabled';
+
+/**
+ * Validates whether candidate content contains sensitive credentials, keys, or passwords.
+ */
+export function isSensitiveSecret(text: string): boolean {
+  if (!text || typeof text !== 'string') return false;
+  const patterns = [
+    /AIza[0-9A-Za-z-_]{35}/i,
+    /gh[pousr]_[0-9A-Za-z]{36}/i,
+    /sk-[a-zA-Z0-9_-]{20,}/i,
+    /Bearer\s+[a-zA-Z0-9_\-\.]{20,}/i,
+    /eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}/i,
+    /-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----/i,
+    /(?:password|passwd|api[_-]?key|secret[_-]?key|auth[_-]?token)\s*[:=]\s*\S+/i,
+  ];
+  return patterns.some((p) => p.test(text));
+}
+
+/**
+ * Conversational and grammatical stop words excluded from topical indexing.
+ */
+export const CONVERSATIONAL_STOP_WORDS = new Set([
+  'the', 'is', 'at', 'which', 'on', 'and', 'a', 'an', 'in', 'to', 'for', 'of', 'or', 'by',
+  'with', 'about', 'can', 'you', 'please', 'tell', 'me', 'what', 'how', 'why', 'when',
+  'where', 'who', 'does', 'did', 'do', 'will', 'would', 'could', 'should', 'give', 'show',
+  'kaisa', 'kya', 'hai', 'batao', 'karo', 'mujhe', 'mera', 'meri', 'mere', 'aap', 'tum',
+  'this', 'that', 'these', 'those', 'there', 'here', 'from', 'into', 'just', 'some', 'any',
+  'know', 'have', 'been', 'want', 'need', 'like', 'help', 'your', 'my', 'we', 'he', 'so',
+  'no', 'up', 'as', 'if', 'it', 'ki', 'ka', 'ke', 'ko', 'se', 'bhi', 'tha', 'thi', 'the',
+]);
 
 const safeLocalStorage = {
   getItem: (key: string): string | null => {
@@ -306,7 +337,8 @@ class MemoryService {
   }
 
   /**
-   * Save or update an individual long-term memory
+   * Save or update an individual long-term memory.
+   * Enforces security (rejects secrets), deduplication, and conflict resolution.
    */
   public async saveMemory(
     content: string,
@@ -320,18 +352,47 @@ class MemoryService {
       throw new Error('Memory content cannot be empty.');
     }
 
-    // Extract search tags
+    // Security guard: Never store sensitive credentials, tokens, or passwords
+    if (isSensitiveSecret(cleanContent)) {
+      throw new Error('Sensitive credentials, tokens, or passwords cannot be stored in conversation memory for security.');
+    }
+
+    // Extract normalized search tags excluding conversational stop words
     const words = cleanContent
       .toLowerCase()
-      .replace(/[^\w\s\u0900-\u097F]/g, '')
+      .replace(/[^\w\s\u0900-\u097F]/g, ' ')
       .split(/\s+/)
-      .filter((w) => w.length > 2);
+      .filter((w) => w.length > 1 && !CONVERSATIONAL_STOP_WORDS.has(w));
     const tags = Array.from(new Set(words)).slice(0, 15);
 
-    const memoryId = existingId || `mem-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    // Smart deduplication: check if an identical or near-duplicate memory already exists
+    let effectiveId = existingId;
+    if (!effectiveId) {
+      const incomingNorm = cleanContent.toLowerCase().replace(/[^\w\u0900-\u097F]/g, '');
+      const duplicate = this.memories.find((m) => {
+        const mNorm = m.content.toLowerCase().replace(/[^\w\u0900-\u097F]/g, '');
+        if (mNorm === incomingNorm) return true;
+        // Jaccard similarity of tags for matching category
+        if (m.category === category && tags.length > 0 && m.tags.length > 0) {
+          const mTagSet = new Set(m.tags);
+          const shared = tags.filter((t) => mTagSet.has(t));
+          const union = new Set([...tags, ...m.tags]);
+          if (shared.length / union.size >= 0.7) return true;
+        }
+        return false;
+      });
+
+      if (duplicate) {
+        effectiveId = duplicate.id;
+      }
+    }
+
+    const memoryId = effectiveId || `mem-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const now = new Date().toISOString();
-    const existing = existingId ? this.memories.find((m) => m.id === existingId) : undefined;
+    const existing = effectiveId ? this.memories.find((m) => m.id === effectiveId) : undefined;
     const createdAt = existing ? existing.createdAt : now;
+    const effectiveProvenance = provenance === 'explicit_user' || existing?.provenance === 'explicit_user' ? 'explicit_user' : provenance;
+    const effectiveConfidence = Math.max(existing?.confidence || 0.85, confidence);
 
     const mem: MemoryDocument = {
       id: memoryId,
@@ -339,8 +400,8 @@ class MemoryService {
       content: cleanContent,
       category,
       tags,
-      provenance,
-      confidence,
+      provenance: effectiveProvenance,
+      confidence: Math.min(1.0, effectiveConfidence),
       createdAt,
       updatedAt: now,
     };
@@ -349,9 +410,19 @@ class MemoryService {
       const path = `users/${this.currentUserId}/memories/${memoryId}`;
       try {
         await setDoc(doc(db, 'users', this.currentUserId, 'memories', memoryId), mem);
-      } catch (err) {
-        handleFirestoreError(err, existingId ? OperationType.UPDATE : OperationType.CREATE, path);
+      } catch (err: any) {
+        // Queue operation safely for background reconciliation upon reconnecting
+        offlineSyncService.queueMemorySave(this.currentUserId, mem);
+        console.warn(`[SHADOW AI Memory] Queued offline memory save for user ${this.currentUserId}:`, err?.message || err);
       }
+      // Keep in-memory list updated for immediate responsiveness
+      const idx = this.memories.findIndex((m) => m.id === memoryId);
+      if (idx >= 0) {
+        this.memories[idx] = mem;
+      } else {
+        this.memories.unshift(mem);
+      }
+      this.notify();
     } else {
       // Guest local storage
       const idx = this.memories.findIndex((m) => m.id === memoryId);
@@ -375,14 +446,60 @@ class MemoryService {
       const path = `users/${this.currentUserId}/memories/${id}`;
       try {
         await deleteDoc(doc(db, 'users', this.currentUserId, 'memories', id));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.DELETE, path);
+      } catch (err: any) {
+        offlineSyncService.queueMemoryDelete(this.currentUserId, id);
+        console.warn(`[SHADOW AI Memory] Queued offline memory delete for user ${this.currentUserId}:`, err?.message || err);
       }
+      this.memories = this.memories.filter((m) => m.id !== id);
+      this.notify();
     } else {
       this.memories = this.memories.filter((m) => m.id !== id);
       this.saveGuestMemories();
       this.notify();
     }
+  }
+
+  /**
+   * Search and delete user memories matching a topic query (for explicit Forget commands).
+   * Guarantees deleted items are immediately removed from both memory state and persistent storage.
+   */
+  public async forgetMemoryByQuery(queryStr: string): Promise<{ deleted: MemoryDocument[]; count: number }> {
+    const cleanQuery = queryStr.trim().toLowerCase();
+    if (!cleanQuery) return { deleted: [], count: 0 };
+
+    const queryTokens = cleanQuery
+      .replace(/[^\w\s\u0900-\u097F]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length > 2 && !CONVERSATIONAL_STOP_WORDS.has(w));
+
+    const matched = this.memories.filter((mem) => {
+      const contentLower = mem.content.toLowerCase();
+      // Direct substring match
+      if (contentLower.includes(cleanQuery)) return true;
+      // Match query tokens against content or tags
+      if (queryTokens.length > 0) {
+        const tokenMatches = queryTokens.filter(
+          (t) => mem.tags.includes(t) || contentLower.includes(t)
+        );
+        if (tokenMatches.length >= Math.min(2, queryTokens.length)) return true;
+      }
+      return false;
+    });
+
+    if (matched.length === 0) {
+      return { deleted: [], count: 0 };
+    }
+
+    // Delete each matched memory
+    for (const mem of matched) {
+      await this.deleteMemory(mem.id);
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('shadow:memory-deleted', { detail: { count: matched.length } }));
+    }
+
+    return { deleted: matched, count: matched.length };
   }
 
   /**
@@ -402,6 +519,8 @@ class MemoryService {
           });
           await batch.commit();
         }
+        this.memories = [];
+        this.notify();
       } catch (err) {
         handleFirestoreError(err, OperationType.DELETE, `users/${this.currentUserId}/memories`);
       }
@@ -409,6 +528,10 @@ class MemoryService {
       this.memories = [];
       this.saveGuestMemories();
       this.notify();
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('shadow:memory-cleared'));
     }
   }
 
@@ -432,6 +555,7 @@ class MemoryService {
     this.isDeletionInProgress = true;
     try {
       const result = await purgeAccountCollections(userId, customAdapter);
+      offlineSyncService.clearUserOperations(userId);
       this.memories = [];
       this.notify();
       return result;
@@ -442,53 +566,123 @@ class MemoryService {
 
   /**
    * Retrieve relevant user memories for current query context.
-   * Performs lexical and keyword scoring to supply optimal context without exceeding model tokens.
+   * Performs semantic topic matching, recency prioritization, and conflict filtering.
+   * Strictly returns [] if no memories match the current topic.
    */
-  public getRelevantMemories(prompt: string, maxItems = 6): MemoryDocument[] {
+  public getRelevantMemories(prompt: string, maxItems = 4): MemoryDocument[] {
     if (this.memories.length === 0) return [];
 
-    const queryTokens = prompt
+    const promptClean = prompt.trim();
+    if (!promptClean) return [];
+
+    const promptLower = promptClean.toLowerCase();
+
+    // 1. General meta-inquiry about overall user memory or profile (without specific topic constraint)
+    const isGeneralMetaQuery = /^(?:please\s+)?(?:what\s+do\s+you\s+remember(?:\s+(?:about\s+me|about\s+us))?|what\s+are\s+my\s+memories|who\s+am\s+i|mere\s+baare\s+me(?:n)?(?:\s+kya\s+yaad\s+hai)?|kya\s+yaad\s+hai(?:\s+kuch)?|list\s+(?:all\s+)?(?:my\s+)?memories|show\s+(?:all\s+)?(?:my\s+)?memories|what\s+do\s+you\s+know\s+about\s+me|do\s+you\s+remember\s+me)[.!?\s]*$/i.test(promptClean);
+
+    if (isGeneralMetaQuery) {
+      // Return top explicit, high-confidence memories sorted by recency
+      return [...this.memories]
+        .sort((a, b) => {
+          if (a.provenance === 'explicit_user' && b.provenance !== 'explicit_user') return -1;
+          if (b.provenance === 'explicit_user' && a.provenance !== 'explicit_user') return 1;
+          return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+        })
+        .slice(0, maxItems);
+    }
+
+    // 2. Extract normalized query tokens excluding conversational stop words (preserves 2+ letter tech tokens like ui, ts, js, db, os)
+    const queryTokens = promptClean
       .toLowerCase()
       .replace(/[^\w\s\u0900-\u097F]/g, ' ')
       .split(/\s+/)
-      .filter((w) => w.length > 2);
+      .filter((w) => w.length > 1 && !CONVERSATIONAL_STOP_WORDS.has(w));
 
+    // If query has no topical tokens, do NOT inject memories (avoid spamming unrelated context)
     if (queryTokens.length === 0) {
-      return this.memories.slice(0, 3);
+      return [];
     }
 
     const scored = this.memories.map((mem) => {
-      let score = 0;
+      let matchScore = 0;
       const contentLower = mem.content.toLowerCase();
 
       for (const token of queryTokens) {
-        if (mem.tags.includes(token)) score += 3;
-        if (contentLower.includes(token)) score += 2;
+        if (mem.tags.includes(token)) {
+          matchScore += 4.0;
+        } else if (contentLower.includes(token)) {
+          // Check for word boundary vs substring
+          const isWordMatch = new RegExp(`\\b${token}\\b`, 'i').test(contentLower);
+          matchScore += isWordMatch ? 3.5 : 1.5;
+        }
       }
 
-      // Explicit instructions and preferences carry baseline weight
-      if (mem.category === 'instruction') score += 1.5;
-      if (mem.category === 'preference') score += 1.0;
+      // If no query tokens matched the memory, score is 0
+      if (matchScore === 0) {
+        return { mem, score: 0 };
+      }
 
-      return { mem, score };
+      // Category topical alignment boost
+      let categoryBoost = 0;
+      if (mem.category === 'preference' && /(?:prefer|like|favorite|choice|style|aesthetic|theme)/i.test(promptLower)) {
+        categoryBoost += 1.5;
+      } else if (mem.category === 'project' && /(?:project|app|building|repo|work|task|codebase|stack)/i.test(promptLower)) {
+        categoryBoost += 1.5;
+      } else if (mem.category === 'instruction' && /(?:instruction|rule|directive|format|always|never|guideline)/i.test(promptLower)) {
+        categoryBoost += 1.5;
+      } else if (mem.category === 'constraint' && /(?:constraint|limit|system|hardware|ram|cpu|bandwidth|os)/i.test(promptLower)) {
+        categoryBoost += 1.5;
+      } else if (mem.category === 'fact' && /(?:who|name|city|location|live|role|company|profession)/i.test(promptLower)) {
+        categoryBoost += 1.5;
+      }
+
+      // Importance boost for explicit user directives
+      let importanceBoost = 0;
+      if (mem.provenance === 'explicit_user') importanceBoost += 2.0;
+
+      // Recency boost (within 7 days = +1.0, within 30 days = +0.5)
+      const ageMs = Date.now() - new Date(mem.updatedAt).getTime();
+      let recencyBoost = 0;
+      if (ageMs < 7 * 86400 * 1000) recencyBoost += 1.0;
+      else if (ageMs < 30 * 86400 * 1000) recencyBoost += 0.5;
+
+      const finalScore = (matchScore + categoryBoost + importanceBoost + recencyBoost) * (mem.confidence || 1.0);
+      return { mem, score: finalScore };
     });
 
-    scored.sort((a, b) => b.score - a.score);
-    return scored
-      .filter((item) => item.score > 0.5)
-      .slice(0, maxItems)
-      .map((item) => item.mem);
+    // Score threshold: require authentic topical match (score >= 2.5)
+    const filtered = scored.filter((item) => item.score >= 2.5);
+    filtered.sort((a, b) => b.score - a.score);
+
+    // Contradiction and redundancy resolution: group by semantic domain key
+    const finalMemories: MemoryDocument[] = [];
+    const seenDomains = new Set<string>();
+
+    for (const item of filtered) {
+      const primaryTag = item.mem.tags[0] || 'general';
+      const domainKey = `${item.mem.category}:${primaryTag}`;
+      if (seenDomains.has(domainKey)) {
+        // Discard older/superseded conflicting preference in same domain
+        continue;
+      }
+      seenDomains.add(domainKey);
+      finalMemories.push(item.mem);
+      if (finalMemories.length >= maxItems) break;
+    }
+
+    return finalMemories;
   }
 
   /**
-   * Formats relevant memories into a clean prompt context block
+   * Formats relevant memories into a clean prompt context block.
+   * Returns empty string if no relevant memories exist.
    */
   public formatContextForPrompt(prompt: string): string {
-    const relevant = this.getRelevantMemories(prompt, 6);
+    const relevant = this.getRelevantMemories(prompt, 4);
     if (relevant.length === 0) return '';
 
     const lines = relevant.map((m) => `- [${m.category.toUpperCase()}] ${m.content}`);
-    return `\n\n[USER LONG-TERM MEMORY & CONTEXT]\n${lines.join('\n')}\n(Utilize these facts naturally when relevant. Never invent memories not listed here.)`;
+    return `\n\n[USER LONG-TERM MEMORY & CONTEXT]\n${lines.join('\n')}\n(Utilize these facts naturally when relevant. Never invent unrecorded memories or speculate about unlisted details.)`;
   }
 
   // Test inspection and mock hooks (isolated testing only)

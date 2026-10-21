@@ -32,6 +32,8 @@ export interface ChatMessage {
   errorCode?: string;
   errorDetail?: string;
   imagePreview?: string;
+  isLocalModel?: boolean;
+  modelSource?: 'cloud' | 'local';
 }
 
 export interface AndroidProjectFile {

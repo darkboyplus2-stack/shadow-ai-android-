@@ -1,7 +1,14 @@
 import { collection, doc, writeBatch, getDocs } from 'firebase/firestore';
 import { db } from './firebase';
 import { memoryService, MemoryDocument, GUEST_STORAGE_KEY } from './memoryService';
-import { sessionService, ChatSession, GUEST_SESSIONS_STORAGE_KEY } from './sessionService';
+import {
+  sessionService,
+  ChatSession,
+  GUEST_SESSIONS_STORAGE_KEY,
+  chunkSession,
+  calculateDocumentByteSize,
+  FIRESTORE_MAX_DOCUMENT_BYTES,
+} from './sessionService';
 import { authService } from './authService';
 
 export interface PendingGuestData {
@@ -25,7 +32,8 @@ export interface MigrationStorageAdapter {
   getGuestMemories: () => MemoryDocument[];
   getGuestSessions: () => ChatSession[];
   saveCloudMemories: (userId: string, memories: MemoryDocument[]) => Promise<void>;
-  saveCloudSessions: (userId: string, sessions: ChatSession[]) => Promise<void>;
+  saveCloudSessions?: (userId: string, sessions: ChatSession[]) => Promise<void>;
+  saveRawSessionDocs?: (userId: string, docs: { id: string; data: any; byteSize: number }[]) => Promise<void>;
   clearGuestStorage: () => void;
 }
 
@@ -171,7 +179,28 @@ class MigrationService {
           await adapter.saveCloudMemories(userId, pending.memories);
         }
         if (pending.sessions.length > 0) {
-          await adapter.saveCloudSessions(userId, pending.sessions);
+          if (adapter.saveRawSessionDocs) {
+            const allSessionDocs: { id: string; data: any; byteSize: number }[] = [];
+            for (const sess of pending.sessions) {
+              const { metadataDoc, chunkDocs } = chunkSession(sess, userId);
+              allSessionDocs.push({
+                id: metadataDoc.id,
+                data: metadataDoc,
+                byteSize: calculateDocumentByteSize(metadataDoc),
+              });
+              for (const chk of chunkDocs) {
+                allSessionDocs.push({
+                  id: chk.id,
+                  data: chk,
+                  byteSize: calculateDocumentByteSize(chk),
+                });
+              }
+            }
+            await adapter.saveRawSessionDocs(userId, allSessionDocs);
+          }
+          if (adapter.saveCloudSessions) {
+            await adapter.saveCloudSessions(userId, pending.sessions);
+          }
         }
         adapter.clearGuestStorage();
       } else {
@@ -193,24 +222,42 @@ class MigrationService {
           }
         }
 
-        // 2. Chunked batch migrate sessions (respects Firestore 500-write limit)
+        // 2. Chunked batch migrate sessions (respects Firestore 500-write limit and 1 MiB doc limit)
         if (pending.sessions.length > 0) {
-          for (let i = 0; i < pending.sessions.length; i += batchSize) {
-            const chunk = pending.sessions.slice(i, i + batchSize);
+          const allSessionDocs: { id: string; data: ChatSession; byteSize: number }[] = [];
+          for (const item of pending.sessions) {
+            const { metadataDoc, chunkDocs } = chunkSession(item, userId);
+            const metaBytes = calculateDocumentByteSize(metadataDoc);
+            if (metaBytes > FIRESTORE_MAX_DOCUMENT_BYTES) {
+              throw new Error(
+                `Session metadata document "${metadataDoc.id}" is ${metaBytes} bytes, exceeding the 1,048,576-byte limit.`
+              );
+            }
+            allSessionDocs.push({ id: metadataDoc.id, data: metadataDoc, byteSize: metaBytes });
+
+            for (const chk of chunkDocs) {
+              const chkBytes = calculateDocumentByteSize(chk);
+              if (chkBytes > FIRESTORE_MAX_DOCUMENT_BYTES) {
+                throw new Error(
+                  `Session chunk document "${chk.id}" is ${chkBytes} bytes, exceeding the 1,048,576-byte limit.`
+                );
+              }
+              allSessionDocs.push({ id: chk.id, data: chk, byteSize: chkBytes });
+            }
+          }
+
+          for (let i = 0; i < allSessionDocs.length; i += batchSize) {
+            const chunk = allSessionDocs.slice(i, i + batchSize);
             const sessBatch = writeBatch(db);
-            for (const item of chunk) {
-              const itemDoc = doc(db, 'users', userId, 'chats', item.id);
-              sessBatch.set(itemDoc, {
-                ...item,
-                userId,
-                updatedAt: new Date().toISOString(),
-              });
+            for (const docItem of chunk) {
+              const itemDoc = doc(db, 'users', userId, 'chats', docItem.id);
+              sessBatch.set(itemDoc, docItem.data);
             }
             await sessBatch.commit();
           }
         }
 
-        // 3. Clear guest storage only after all batch commits succeed
+        // 3. Clear guest storage strictly only after all batch commits succeed
         safeLocalStorage.removeItem(GUEST_STORAGE_KEY);
         safeLocalStorage.removeItem(GUEST_SESSIONS_STORAGE_KEY);
         safeLocalStorage.setItem(`shadow_migrated_${userId}`, new Date().toISOString());

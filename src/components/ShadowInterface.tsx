@@ -14,7 +14,7 @@ import { SessionsDrawer } from './SessionsDrawer';
 import { FormattedMessage } from './FormattedMessage';
 import { TypingIndicator } from './TypingIndicator';
 import { soundFx } from '../services/soundFx';
-import { geminiService, GeminiServiceError, VisualAttachment } from '../services/geminiService';
+import { geminiService, GeminiServiceError, VisualAttachment, ChatHistoryItem } from '../services/geminiService';
 import { voiceService, MicStatus, SpeechLanguage } from '../services/voiceService';
 import { memoryService, MemoryDocument } from '../services/memoryService';
 import { authService, UserProfile } from '../services/authService';
@@ -24,6 +24,8 @@ import {
   MicOff,
   Send,
   RotateCcw,
+  RefreshCw,
+  Volume2,
   Settings,
   Smartphone,
   Maximize2,
@@ -31,6 +33,7 @@ import {
   Info,
   ShieldAlert,
   MessageSquare,
+  Search,
   ChevronDown,
   Zap,
   Bot,
@@ -46,7 +49,13 @@ import {
   Brain,
   LogIn,
   Paperclip,
+  Wifi,
+  WifiOff,
+  Cpu,
+  HardDrive,
 } from 'lucide-react';
+import { connectivityService, ConnectivityState } from '../services/connectivityService';
+import { offlineModelService, OfflineModelState } from '../services/offlineModelService';
 
 interface ShadowInterfaceProps {
   onOpenAndroidHub: () => void;
@@ -73,17 +82,20 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
   const [micStatus, setMicStatus] = useState<MicStatus>('idle');
   const [speechLanguage, setSpeechLanguage] = useState<SpeechLanguage>('en-IN');
   const [interimTranscript, setInterimTranscript] = useState<string>('');
-  const [, setIsVoiceSpeaking] = useState(false);
+  const [isVoiceSpeaking, setIsVoiceSpeaking] = useState(false);
   const [showPermissionGuide, setShowPermissionGuide] = useState(false);
   const [showMemoryDrawer, setShowMemoryDrawer] = useState(false);
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [showSessionsDrawer, setShowSessionsDrawer] = useState(false);
   const [activeSession, setActiveSession] = useState<ChatSession | null>(null);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const [attachedImage, setAttachedImage] = useState<VisualAttachment | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [memoryCount, setMemoryCount] = useState<number>(0);
   const [syncStatus, setSyncStatus] = useState<string>('guest');
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [connectivityState, setConnectivityState] = useState<ConnectivityState>(connectivityService.getState());
+  const [offlineModelState, setOfflineModelState] = useState<OfflineModelState>(offlineModelService.getModelState());
 
   // Chat message history with a natural, intelligent conversational greeting
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -116,13 +128,15 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
   const inputRef = useRef<HTMLInputElement>(null);
   const isSendingPromptRef = useRef(false);
   const [isAiResponding, setIsAiResponding] = useState<boolean>(false);
+  const [regeneratingMessageId, setRegeneratingMessageId] = useState<string | null>(null);
+  const [isRegenerating, setIsRegenerating] = useState<boolean>(false);
 
   // Auto-scroll chat to bottom when messages or typing state changes
   useEffect(() => {
     if (chatScrollRef.current) {
       chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
     }
-  }, [messages, isDrawerOpen, isAiResponding]);
+  }, [messages, isDrawerOpen, isAiResponding, isRegenerating]);
 
   // Subscribe to long-term memory updates and auth profile
   useEffect(() => {
@@ -142,25 +156,54 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
         showToast(`Memory formed: "${saved.content.slice(0, 36)}${saved.content.length > 36 ? '…' : ''}"`);
       }
     };
+
+    const handleMemoryDeleted = (e: any) => {
+      const count = e.detail?.count || 1;
+      showToast(`${count} ${count === 1 ? 'memory' : 'memories'} forgotten.`);
+    };
+
+    const handleMemoryCleared = () => {
+      showToast('All conversation memories have been cleared.');
+    };
+
     window.addEventListener('shadow:memory-saved', handleMemorySaved as EventListener);
+    window.addEventListener('shadow:memory-deleted', handleMemoryDeleted as EventListener);
+    window.addEventListener('shadow:memory-cleared', handleMemoryCleared as EventListener);
 
     return () => {
       unsubMem();
       unsubAuth();
       window.removeEventListener('shadow:memory-saved', handleMemorySaved as EventListener);
+      window.removeEventListener('shadow:memory-deleted', handleMemoryDeleted as EventListener);
+      window.removeEventListener('shadow:memory-cleared', handleMemoryCleared as EventListener);
     };
   }, []);
 
-  // Synchronize conversation threads
+  // Synchronize conversation threads and AI service history
   useEffect(() => {
     const unsubSessions = sessionService.subscribe((list, activeId) => {
       const active = list.find((s) => s.id === activeId) || list[0] || null;
       setActiveSession(active);
       if (active && active.messages.length > 0) {
         setMessages(active.messages);
+        geminiService.syncHistoryFromMessages(active.messages);
       }
     });
     return () => unsubSessions();
+  }, []);
+
+  // Monitor connectivity state and offline model status
+  useEffect(() => {
+    const unsubConn = connectivityService.subscribe((cState) => {
+      setConnectivityState(cState.overallState);
+    });
+    const unsubOffline = offlineModelService.subscribe((mState) => {
+      setOfflineModelState(mState);
+    });
+    return () => {
+      unsubConn();
+      unsubOffline();
+    };
   }, []);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -296,12 +339,78 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
     setIsAiResponding(true);
 
     try {
-      const response = await geminiService.sendMessage(
-        promptText,
-        config.intelligenceMode,
-        config.personalityArchetype,
-        visualAttachment
-      );
+      const isNetworkOffline = !connectivityService.isOnline();
+      const isOfflineModeActive = offlineModelService.isOfflineModeEnabled();
+      const shouldUseLocalModel = isNetworkOffline || isOfflineModeActive;
+
+      let replyText = '';
+      let modelUsed = '';
+      let latencyMs = 0;
+      let isLocal = false;
+
+      if (shouldUseLocalModel) {
+        if (visualAttachment) {
+          if (isNetworkOffline) {
+            throw new GeminiServiceError(
+              'Offline Mode supports text interactions. Multimodal image analysis requires an online connection to Google Gemini.',
+              400,
+              'OFFLINE_MULTIMODAL_UNSUPPORTED',
+              false,
+              'Connect to the internet to analyze visual attachments.'
+            );
+          }
+          // If online and image attached, allow falling through to Gemini cloud for vision
+        }
+
+        if (!visualAttachment) {
+          if (!offlineModelService.isModelReady()) {
+            const noModelMsg = isNetworkOffline
+              ? 'Offline mode active: No internet connection detected and On-Device AI model is not installed. Reconnect to the internet or install the local model from Settings to chat offline.'
+              : 'Offline Mode is enabled in Settings, but the on-device AI model is not downloaded yet. Please download the model in Settings, or disable Offline Mode to use cloud AI.';
+            throw new GeminiServiceError(
+              noModelMsg,
+              503,
+              isNetworkOffline ? 'NETWORK_OFFLINE_NO_MODEL' : 'OFFLINE_MODEL_NOT_DOWNLOADED',
+              true,
+              'Open Settings > Offline Mode & On-Device AI to manage model.'
+            );
+          }
+
+          // Local on-device inference!
+          const recentHistory = messages
+            .slice(-10)
+            .filter((m) => !m.isError && m.text.trim())
+            .map((m) => ({
+              role: (m.sender === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
+              content: m.text,
+            }));
+
+          const localRes = await offlineModelService.generateLocalResponse(
+            finalPrompt,
+            recentHistory,
+            {
+              mode: isSerious ? 'serious' : 'standard',
+            }
+          );
+          replyText = localRes.reply;
+          modelUsed = localRes.modelUsed;
+          latencyMs = localRes.latencyMs;
+          isLocal = true;
+        }
+      }
+
+      if (!isLocal) {
+        const response = await geminiService.sendMessage(
+          promptText,
+          config.intelligenceMode,
+          config.personalityArchetype,
+          visualAttachment
+        );
+        replyText = response.reply;
+        modelUsed = response.modelUsed;
+        latencyMs = response.latencyMs;
+      }
+
       setIsAiResponding(false);
 
       // Successfully answered, clear last failed prompt
@@ -309,13 +418,15 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
 
       // Add Shadow response to transcript
       const shadowMsg: ChatMessage = {
-        id: `shadow-${Date.now()}`,
+        id: `shadow-${isLocal ? 'local-' : ''}${Date.now()}`,
         sender: 'shadow',
-        text: response.reply,
+        text: replyText,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        modelUsed: response.modelUsed,
-        latencyMs: response.latencyMs,
-        mode: response.mode,
+        modelUsed,
+        latencyMs,
+        mode: config.intelligenceMode,
+        isLocalModel: isLocal,
+        modelSource: isLocal ? 'local' : 'cloud',
       };
 
       setMessages((prev) => {
@@ -333,7 +444,7 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
         setState('SPEAKING');
         setIsVoiceSpeaking(true);
 
-        voiceService.speak(response.reply, {
+        voiceService.speak(replyText, {
           rate: config.speechRate,
           pitch: config.speechPitch,
           voice: config.ttsVoice || 'Charon',
@@ -357,7 +468,7 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
         setTimeout(() => {
           setState('IDLE');
           setMicStatus('idle');
-        }, Math.min(Math.max(response.reply.length * 28, 1800), 5000));
+        }, Math.min(Math.max(replyText.length * 28, 1800), 5000));
       }
     } catch (err: any) {
       setIsAiResponding(false);
@@ -407,6 +518,233 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
         setState((curr) => (curr === 'ERROR' ? 'IDLE' : curr));
       }, 2500);
     } finally {
+      setIsAiResponding(false);
+      isSendingPromptRef.current = false;
+    }
+  };
+
+  // Voice playback on-demand for assistant messages
+  const handleSpeakMessage = (text: string) => {
+    if (!text || isVoiceSpeaking) return;
+    voiceService.resumePlaybackContext();
+    soundFx.playClick(640);
+    setState('SPEAKING');
+    setIsVoiceSpeaking(true);
+
+    voiceService.speak(text, {
+      rate: config.speechRate,
+      pitch: config.speechPitch,
+      voice: config.ttsVoice || 'Charon',
+      onStart: () => {
+        setState('SPEAKING');
+        setIsVoiceSpeaking(true);
+      },
+      onAmplitude: (amp) => {
+        setAudioAmplitude(amp);
+      },
+      onEnd: () => {
+        setAudioAmplitude(0);
+        setIsVoiceSpeaking(false);
+        setState('IDLE');
+        setMicStatus('idle');
+      },
+    });
+  };
+
+  // Regenerate Response action handler for completed assistant messages
+  const handleRegenerateResponse = async (targetMessageId: string) => {
+    voiceService.resumePlaybackContext();
+    if (isRegenerating || isAiResponding || isSendingPromptRef.current) return;
+
+    // Locate the assistant message
+    const targetIdx = messages.findIndex((m) => m.id === targetMessageId);
+    if (targetIdx === -1) return;
+    const targetMsg = messages[targetIdx];
+
+    // Locate the preceding user message to regenerate from
+    let precedingUserMsg: ChatMessage | null = null;
+    let precedingUserIdx = -1;
+    for (let i = targetIdx - 1; i >= 0; i--) {
+      if (messages[i].sender === 'user') {
+        precedingUserMsg = messages[i];
+        precedingUserIdx = i;
+        break;
+      }
+    }
+
+    if (!precedingUserMsg || !precedingUserMsg.text.trim()) {
+      showToast('Cannot find preceding user prompt to regenerate.');
+      return;
+    }
+
+    // Guard against concurrent submissions
+    isSendingPromptRef.current = true;
+    setRegeneratingMessageId(targetMessageId);
+    setIsRegenerating(true);
+    setIsAiResponding(true);
+    soundFx.playClick(680);
+
+    const isSerious = (targetMsg.mode || config.intelligenceMode) === 'serious';
+    setState(isSerious ? 'WORKING' : 'THINKING');
+
+    // Build historical context strictly before the preceding user turn (latest 20 turns)
+    const historyContext: ChatHistoryItem[] = [];
+    const startIdx = Math.max(0, precedingUserIdx - 20);
+    for (let i = startIdx; i < precedingUserIdx; i++) {
+      const m = messages[i];
+      if (m.isError) continue;
+      const txt = m.text?.trim();
+      if (!txt) continue;
+      if (m.sender === 'user') {
+        historyContext.push({ role: 'user', parts: [{ text: txt }] });
+      } else if (m.sender === 'shadow') {
+        historyContext.push({ role: 'model', parts: [{ text: txt }] });
+      }
+    }
+
+    // Preserve image attachment if the user had attached visual data
+    let visualAttachment: VisualAttachment | null = null;
+    if (precedingUserMsg.imagePreview && precedingUserMsg.imagePreview.startsWith('data:')) {
+      const mimeMatch = precedingUserMsg.imagePreview.match(/^data:([^;]+);base64,/);
+      if (mimeMatch) {
+        visualAttachment = {
+          mimeType: mimeMatch[1],
+          data: precedingUserMsg.imagePreview,
+          previewUrl: precedingUserMsg.imagePreview,
+        };
+      }
+    }
+
+    try {
+      const isNetworkOffline = !connectivityService.isOnline();
+      const isOfflineModeActive = offlineModelService.isOfflineModeEnabled();
+      const shouldUseLocalModel = isNetworkOffline || isOfflineModeActive;
+
+      let replyText = '';
+      let modelUsed = '';
+      let latencyMs = 0;
+      let isLocal = false;
+
+      if (shouldUseLocalModel) {
+        if (!offlineModelService.isModelReady()) {
+          throw new GeminiServiceError(
+            isNetworkOffline
+              ? 'Offline mode active: No internet connection detected and On-Device AI model is not installed.'
+              : 'Offline Mode is enabled in Settings, but the on-device AI model is not downloaded yet.',
+            503,
+            'OFFLINE_REGEN_NO_MODEL',
+            false,
+            'Connect to the internet or download the model from Settings.'
+          );
+        }
+
+        const localHistory = historyContext.map((item) => ({
+          role: (item.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
+          content: item.parts.map((p) => p.text).join(' '),
+        }));
+
+        const localRes = await offlineModelService.generateLocalResponse(
+          precedingUserMsg.text,
+          localHistory,
+          {
+            mode: isSerious ? 'serious' : 'standard',
+          }
+        );
+        replyText = localRes.reply;
+        modelUsed = localRes.modelUsed;
+        latencyMs = localRes.latencyMs;
+        isLocal = true;
+      } else {
+        const response = await geminiService.regenerateResponse(
+          precedingUserMsg.text,
+          historyContext,
+          targetMsg.mode || config.intelligenceMode,
+          config.personalityArchetype,
+          visualAttachment
+        );
+        replyText = response.reply;
+        modelUsed = response.modelUsed;
+        latencyMs = response.latencyMs;
+      }
+
+      // Successfully regenerated! Replace the selected assistant response in-place
+      setMessages((prev) => {
+        const next = [...prev];
+        const idx = next.findIndex((m) => m.id === targetMessageId);
+        if (idx !== -1) {
+          next[idx] = {
+            ...next[idx],
+            text: replyText,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            modelUsed,
+            latencyMs,
+            mode: targetMsg.mode || config.intelligenceMode,
+            isLocalModel: isLocal,
+            modelSource: isLocal ? 'local' : 'cloud',
+            isError: false,
+            canRetry: false,
+            errorCode: undefined,
+            errorDetail: undefined,
+          };
+          geminiService.syncHistoryFromMessages(next);
+          if (activeSession) {
+            queueMicrotask(() => {
+              sessionService.updateSessionMessages(activeSession.id, next);
+            });
+          }
+        }
+        return next;
+      });
+
+      // Clear any prior failed prompt since regeneration succeeded
+      setLastFailedPrompt(null);
+
+      // Speak response if voice output is enabled
+      if (config.speechOutputEnabled) {
+        setState('SPEAKING');
+        setIsVoiceSpeaking(true);
+        voiceService.speak(replyText, {
+          rate: config.speechRate,
+          pitch: config.speechPitch,
+          voice: config.ttsVoice || 'Charon',
+          onStart: () => {
+            setState('SPEAKING');
+            setIsVoiceSpeaking(true);
+          },
+          onAmplitude: (amp) => {
+            setAudioAmplitude(amp);
+          },
+          onEnd: () => {
+            setAudioAmplitude(0);
+            setIsVoiceSpeaking(false);
+            setState('IDLE');
+            setMicStatus('idle');
+          },
+        });
+      } else {
+        setState('SPEAKING');
+        setTimeout(() => {
+          setState('IDLE');
+          setMicStatus('idle');
+        }, 1500);
+      }
+
+      showToast('Response regenerated.');
+    } catch (err: any) {
+      console.error('[SHADOW AI Regenerate Error]:', err);
+      const errorMessage =
+        err instanceof GeminiServiceError
+          ? err.userMessage
+          : err?.message || 'Failed to regenerate response. Please tap Regenerate to retry.';
+      setState('ERROR');
+      soundFx.playClick(320);
+      showToast(`Regeneration failed: ${errorMessage}`);
+      setTimeout(() => {
+        setState((curr) => (curr === 'ERROR' ? 'IDLE' : curr));
+      }, 2500);
+    } finally {
+      setRegeneratingMessageId(null);
+      setIsRegenerating(false);
       setIsAiResponding(false);
       isSendingPromptRef.current = false;
     }
@@ -667,6 +1005,16 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
               <span className="hidden sm:inline">Threads</span>
             </button>
 
+            {/* Quick Search Button */}
+            <button
+              onClick={() => setShowSessionsDrawer(true)}
+              title="Search Conversations & Messages"
+              className="px-2.5 py-1 rounded-full text-[10px] font-mono font-bold flex items-center space-x-1.5 border border-white/20 bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all duration-300"
+            >
+              <Search className="w-3 h-3 text-cyan-400" />
+              <span className="hidden sm:inline">Search</span>
+            </button>
+
             {/* Long-Term Memory Core HUD Button */}
             <button
               onClick={() => setShowMemoryDrawer(true)}
@@ -712,6 +1060,51 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
             >
               <ShieldAlert className="w-3 h-3" />
               <span>{isSeriousActive ? 'SERIOUS' : 'STANDARD'}</span>
+            </button>
+
+            {/* Offline / Connectivity Mode Badge */}
+            <button
+              onClick={() => setShowSettings(true)}
+              title={
+                offlineModelState.isReady
+                  ? 'On-Device AI Active (SmolLM2 ready) • Tap to view offline settings'
+                  : connectivityState === 'OFFLINE'
+                  ? 'Offline: No internet detected • Tap to view offline settings'
+                  : offlineModelState.offlineModeEnabled
+                  ? 'Offline Mode enabled (Model downloading/not ready) • Tap for settings'
+                  : 'Online Mode Active (Google Gemini cloud) • Tap for offline settings'
+              }
+              className={`px-2.5 py-1 rounded-full text-[10px] font-mono font-bold flex items-center space-x-1.5 border transition-all duration-300 ${
+                offlineModelState.isReady
+                  ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300 shadow-[0_0_10px_rgba(16,185,129,0.2)]'
+                  : connectivityState === 'OFFLINE'
+                  ? 'border-rose-500/40 bg-rose-500/15 text-rose-300'
+                  : offlineModelState.offlineModeEnabled
+                  ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+                  : 'border-white/15 bg-white/5 text-neutral-300 hover:text-white'
+              }`}
+            >
+              {offlineModelState.isReady ? (
+                <>
+                  <Cpu className="w-3 h-3 text-emerald-400 animate-pulse" />
+                  <span className="hidden sm:inline">LOCAL AI</span>
+                </>
+              ) : connectivityState === 'OFFLINE' ? (
+                <>
+                  <WifiOff className="w-3 h-3 text-rose-400" />
+                  <span className="hidden sm:inline">OFFLINE</span>
+                </>
+              ) : offlineModelState.offlineModeEnabled ? (
+                <>
+                  <HardDrive className="w-3 h-3 text-amber-400" />
+                  <span className="hidden sm:inline">OFFLINE MODE</span>
+                </>
+              ) : (
+                <>
+                  <Wifi className="w-3 h-3 text-emerald-400/80" />
+                  <span className="hidden md:inline">ONLINE</span>
+                </>
+              )}
             </button>
 
             {/* Android Project Hub Button */}
@@ -837,77 +1230,145 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
 
               {/* Drawer Messages Stream */}
               <div ref={chatScrollRef} className="flex-1 p-4 overflow-y-auto space-y-3 font-sans text-xs">
-                {messages.map((msg) => (
-                  <div
-                    key={msg.id}
-                    className={`flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}
-                  >
-                    <div className="flex items-center space-x-1.5 mb-1 text-[10px] text-neutral-400 font-mono">
-                      {msg.sender === 'user' ? (
-                        <>
-                          <span>User</span>
-                          <User className="w-3 h-3 text-neutral-300" />
-                        </>
-                      ) : (
-                        <>
-                          <Bot className="w-3 h-3 text-white" />
-                          <span className="text-white font-semibold">Shadow</span>
-                          {msg.modelUsed && !msg.isError && (
-                            <span className="px-1.5 py-0.2 rounded bg-white/10 text-slate-300 border border-white/20 text-[9px]">
-                              {msg.modelUsed}
-                            </span>
-                          )}
-                          {msg.latencyMs && (
-                            <span className="text-neutral-500 text-[9px] flex items-center space-x-0.5">
-                              <Clock className="w-2.5 h-2.5" />
-                              <span>{msg.latencyMs}ms</span>
-                            </span>
-                          )}
-                        </>
-                      )}
-                    </div>
+                {messages.map((msg, msgIndex) => {
+                  const isThisMsgRegenerating = regeneratingMessageId === msg.id;
+                  const hasPrecedingUserMsg =
+                    msg.sender === 'shadow' &&
+                    !msg.isError &&
+                    messages.slice(0, msgIndex).some((m) => m.sender === 'user');
+
+                  return (
                     <div
-                      className={`max-w-[88%] rounded-2xl px-3.5 py-2.5 leading-relaxed ${
-                        msg.isError
-                          ? 'bg-rose-950/40 text-rose-100 rounded-tl-none border border-rose-500/40 shadow-sm'
-                          : msg.sender === 'user'
-                          ? 'bg-neutral-800 text-neutral-100 rounded-tr-none border border-neutral-700/60'
-                          : msg.mode === 'serious'
-                          ? 'bg-gradient-to-br from-[#161822] to-[#0f1018] text-white rounded-tl-none border border-white/40 shadow-md shadow-white/5'
-                          : 'bg-[#10121c] text-slate-200 rounded-tl-none border border-white/15'
+                      key={msg.id}
+                      id={`msg-${msg.id}`}
+                      className={`flex flex-col transition-all duration-300 ${
+                        msg.sender === 'user' ? 'items-end' : 'items-start'
+                      } ${
+                        highlightedMessageId === msg.id
+                          ? 'p-2 rounded-2xl ring-2 ring-cyan-400 bg-cyan-950/30 shadow-[0_0_20px_rgba(6,182,212,0.4)]'
+                          : ''
                       }`}
                     >
-                      <div className="flex items-start space-x-2">
-                        {msg.isError && <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />}
-                        <div className="flex-1 whitespace-pre-wrap">
-                          {msg.imagePreview && (
-                            <div className="mb-2">
-                              <img
-                                src={msg.imagePreview}
-                                alt="Visual upload"
-                                className="max-h-48 max-w-full rounded-xl border border-white/20 object-contain bg-black/40 shadow-md"
-                              />
-                            </div>
-                          )}
-                          {msg.sender === 'shadow' ? (
-                            <FormattedMessage content={msg.text} />
-                          ) : (
-                            <div>{msg.text}</div>
-                          )}
-                          {msg.errorCode && (
-                            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                              <span className="px-1.5 py-0.5 rounded bg-rose-500/25 text-rose-300 font-mono text-[9px] border border-rose-500/30">
-                                Code: {msg.errorCode}
+                      <div className="flex items-center space-x-1.5 mb-1 text-[10px] text-neutral-400 font-mono">
+                        {msg.sender === 'user' ? (
+                          <>
+                            <span>User</span>
+                            <User className="w-3 h-3 text-neutral-300" />
+                          </>
+                        ) : (
+                          <>
+                            <Bot className="w-3 h-3 text-white" />
+                            <span className="text-white font-semibold">Shadow</span>
+                            {msg.isLocalModel && (
+                              <span className="px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[9px] flex items-center space-x-1 font-mono">
+                                <Cpu className="w-2.5 h-2.5 text-emerald-400" />
+                                <span>On-Device</span>
                               </span>
-                              {msg.errorDetail && (
-                                <span className="px-1.5 py-0.5 rounded bg-black/40 text-neutral-300 font-mono text-[9px] border border-white/10 max-w-[260px] truncate" title={msg.errorDetail}>
-                                  {msg.errorDetail}
-                                </span>
-                              )}
-                            </div>
-                          )}
-                        </div>
+                            )}
+                            {msg.modelUsed && !msg.isError && (
+                              <span className="px-1.5 py-0.2 rounded bg-white/10 text-slate-300 border border-white/20 text-[9px]">
+                                {msg.modelUsed}
+                              </span>
+                            )}
+                            {msg.latencyMs && (
+                              <span className="text-neutral-500 text-[9px] flex items-center space-x-0.5">
+                                <Clock className="w-2.5 h-2.5" />
+                                <span>{msg.latencyMs}ms</span>
+                              </span>
+                            )}
+                          </>
+                        )}
                       </div>
+                      <div
+                        className={`max-w-[88%] rounded-2xl px-3.5 py-2.5 leading-relaxed transition-all duration-200 ${
+                          msg.isError
+                            ? 'bg-rose-950/40 text-rose-100 rounded-tl-none border border-rose-500/40 shadow-sm'
+                            : msg.sender === 'user'
+                            ? 'bg-neutral-800 text-neutral-100 rounded-tr-none border border-neutral-700/60'
+                            : isThisMsgRegenerating
+                            ? 'bg-[#10121c] text-slate-200 rounded-tl-none border border-cyan-400/50 shadow-md shadow-cyan-500/10'
+                            : msg.mode === 'serious'
+                            ? 'bg-gradient-to-br from-[#161822] to-[#0f1018] text-white rounded-tl-none border border-white/40 shadow-md shadow-white/5'
+                            : 'bg-[#10121c] text-slate-200 rounded-tl-none border border-white/15'
+                        }`}
+                      >
+                        <div className="flex items-start space-x-2">
+                          {msg.isError && <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />}
+                          <div className="flex-1 whitespace-pre-wrap">
+                            {msg.imagePreview && (
+                              <div className="mb-2">
+                                <img
+                                  src={msg.imagePreview}
+                                  alt="Visual upload"
+                                  className="max-h-48 max-w-full rounded-xl border border-white/20 object-contain bg-black/40 shadow-md"
+                                />
+                              </div>
+                            )}
+                            {msg.sender === 'shadow' ? (
+                              <FormattedMessage content={msg.text} />
+                            ) : (
+                              <div>{msg.text}</div>
+                            )}
+                            {msg.errorCode && (
+                              <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                                <span className="px-1.5 py-0.5 rounded bg-rose-500/25 text-rose-300 font-mono text-[9px] border border-rose-500/30">
+                                  Code: {msg.errorCode}
+                                </span>
+                                {msg.errorDetail && (
+                                  <span className="px-1.5 py-0.5 rounded bg-black/40 text-neutral-300 font-mono text-[9px] border border-white/10 max-w-[260px] truncate" title={msg.errorDetail}>
+                                    {msg.errorDetail}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Completed Assistant Message Action Bar: Regenerate & Speak */}
+                        {hasPrecedingUserMsg && (
+                          <div className="mt-2.5 pt-2 border-t border-white/10 flex items-center justify-between text-[11px]">
+                            <div className="flex items-center space-x-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleRegenerateResponse(msg.id)}
+                                disabled={isRegenerating || isAiResponding}
+                                className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/15 text-slate-300 hover:text-white border border-white/10 hover:border-cyan-400/40 text-[10px] font-medium transition active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed group"
+                                title="Regenerate response"
+                                aria-label="Regenerate response"
+                              >
+                                {isThisMsgRegenerating ? (
+                                  <>
+                                    <Loader2 className="w-3 h-3 text-cyan-400 animate-spin" />
+                                    <span className="text-cyan-300 font-mono text-[9px]">Regenerating...</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <RefreshCw className="w-3 h-3 text-slate-400 group-hover:text-cyan-300 transition-colors" />
+                                    <span>Regenerate</span>
+                                  </>
+                                )}
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => handleSpeakMessage(msg.text)}
+                                disabled={isRegenerating}
+                                className="inline-flex items-center space-x-1 px-2 py-1 rounded-lg bg-white/5 hover:bg-white/15 text-slate-300 hover:text-white border border-white/10 text-[10px] transition active:scale-95 disabled:opacity-50"
+                                title="Listen to this response"
+                                aria-label="Listen to response"
+                              >
+                                <Volume2 className="w-3 h-3 text-slate-400" />
+                                <span>Listen</span>
+                              </button>
+                            </div>
+
+                            {msg.mode === 'serious' && (
+                              <span className="text-[9px] font-mono text-cyan-400/70 uppercase tracking-wider">
+                                Serious
+                              </span>
+                            )}
+                          </div>
+                        )}
 
                       {/* Visible Retry Action for honest error handling */}
                       {msg.isError && msg.failedPrompt && (
@@ -944,7 +1405,13 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
                       )}
                     </div>
                   </div>
-                ))}
+                );
+              })}
+
+                {/* Live Typing Indicator */}
+                {isAiResponding && (
+                  <TypingIndicator isSerious={isSeriousActive} className="mt-1" />
+                )}
               </div>
 
               {/* Drawer Quick Suggestions */}
@@ -1013,22 +1480,39 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
           {/* Quick Prompts Bar (When drawer is closed) */}
           {!isDrawerOpen && (
             <div className="flex items-center justify-center space-x-1.5 overflow-x-auto py-1 max-w-xl mx-auto w-full">
-              {QUICK_PROMPTS.slice(0, 2).map((p) => (
+              {isAiResponding ? (
                 <button
-                  key={p}
-                  onClick={() => handleSendMessage(p)}
-                  className="px-2.5 py-0.8 rounded-full bg-[#0c0d14]/90 hover:bg-white/10 border border-neutral-800 hover:border-white/40 text-neutral-400 hover:text-white text-[10px] truncate max-w-[200px] transition backdrop-blur-sm"
+                  type="button"
+                  onClick={() => setIsDrawerOpen(true)}
+                  className="px-3.5 py-1.5 rounded-full bg-[#10121c]/95 hover:bg-[#181a28] border border-cyan-500/40 text-cyan-200 text-[11px] font-mono flex items-center space-x-2 transition shadow-lg shadow-cyan-950/40 backdrop-blur-md animate-in fade-in"
+                  title="Open transcript to watch response generation"
                 >
-                  {p}
+                  <div className="flex items-center space-x-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
+                  </div>
+                  <span>Shadow is thinking… Open Transcript</span>
                 </button>
-              ))}
-              <button
-                onClick={() => setIsDrawerOpen(true)}
-                className="px-2 py-0.8 rounded-full bg-white/10 hover:bg-white/20 text-slate-200 text-[10px] border border-white/25 flex items-center space-x-1"
-              >
-                <MessageSquare className="w-3 h-3" />
-                <span>Transcript</span>
-              </button>
+              ) : (
+                <>
+                  {QUICK_PROMPTS.slice(0, 2).map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => handleSendMessage(p)}
+                      className="px-2.5 py-0.8 rounded-full bg-[#0c0d14]/90 hover:bg-white/10 border border-neutral-800 hover:border-white/40 text-neutral-400 hover:text-white text-[10px] truncate max-w-[200px] transition backdrop-blur-sm"
+                    >
+                      {p}
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => setIsDrawerOpen(true)}
+                    className="px-2 py-0.8 rounded-full bg-white/10 hover:bg-white/20 text-slate-200 text-[10px] border border-white/25 flex items-center space-x-1"
+                  >
+                    <MessageSquare className="w-3 h-3" />
+                    <span>Transcript</span>
+                  </button>
+                </>
+              )}
             </div>
           )}
 
@@ -1272,7 +1756,9 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
                 onChange={(e) => setChatInput(e.target.value)}
                 onPaste={handlePaste}
                 placeholder={
-                  micStatus === 'requesting_permission'
+                  isAiResponding
+                    ? 'Shadow is thinking and composing a response…'
+                    : micStatus === 'requesting_permission'
                     ? 'Requesting microphone permission…'
                     : micStatus === 'listening'
                     ? 'Listening… Speak now'
@@ -1286,14 +1772,21 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
               />
               <button
                 type="submit"
-                disabled={!chatInput.trim() && !attachedImage}
+                disabled={isAiResponding || (!chatInput.trim() && !attachedImage)}
                 className={`absolute right-1.5 top-1.5 w-9 h-9 rounded-xl flex items-center justify-center transition ${
-                  chatInput.trim() || attachedImage
+                  isAiResponding
+                    ? 'bg-neutral-800 text-cyan-400 cursor-not-allowed border border-cyan-500/25'
+                    : chatInput.trim() || attachedImage
                     ? 'bg-white text-black hover:bg-slate-200 shadow-md shadow-white/20'
                     : 'text-neutral-600 hover:text-neutral-400'
                 }`}
+                title={isAiResponding ? 'Response in progress' : 'Send message'}
               >
-                <Send className="w-4 h-4" />
+                {isAiResponding ? (
+                  <Loader2 className="w-4 h-4 text-cyan-400 animate-spin" />
+                ) : (
+                  <Send className="w-4 h-4" />
+                )}
               </button>
             </div>
 
@@ -1340,16 +1833,35 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
               className="flex items-center space-x-1 hover:text-white transition"
               title="Open Diagnostics"
             >
-              <Zap className="w-3 h-3 text-emerald-400" />
-              <span>Proxy /api/chat active</span>
+              {offlineModelState.isReady ? (
+                <>
+                  <Cpu className="w-3 h-3 text-emerald-400" />
+                  <span className="text-emerald-300">Local Model Active (SmolLM2)</span>
+                </>
+              ) : connectivityState === 'OFFLINE' ? (
+                <>
+                  <WifiOff className="w-3 h-3 text-rose-400" />
+                  <span className="text-rose-300">Offline Mode</span>
+                </>
+              ) : (
+                <>
+                  <Zap className="w-3 h-3 text-emerald-400" />
+                  <span>Proxy /api/chat active</span>
+                </>
+              )}
             </button>
             <button
               type="button"
-              onClick={() => setShowDiagnostics(true)}
+              onClick={() => setShowSettings(true)}
               className="hover:text-white transition"
-              title="Open Diagnostics"
+              title="Open Settings"
             >
-              {isSeriousActive ? 'gemini-3.8-flash' : 'gemini-3.5-flash-lite'} • Galaxy F55
+              {offlineModelState.isReady
+                ? 'On-Device AI'
+                : isSeriousActive
+                ? 'gemini-3.8-flash'
+                : 'gemini-3.5-flash-lite'}{' '}
+              • Galaxy F55
             </button>
           </div>
         </footer>
@@ -1392,10 +1904,26 @@ export const ShadowInterface: React.FC<ShadowInterfaceProps> = ({ onOpenAndroidH
           <SessionsDrawer
             isOpen={showSessionsDrawer}
             onClose={() => setShowSessionsDrawer(false)}
-            onSelectSession={(session) => {
+            onSelectSession={(session, targetMessageId) => {
+              setIsAiResponding(false);
               setActiveSession(session);
               setMessages(session.messages || []);
               setShowSessionsDrawer(false);
+
+              // If navigated from a specific search match, open transcript log and scroll to message
+              if (targetMessageId) {
+                setHighlightedMessageId(targetMessageId);
+                setIsDrawerOpen(true);
+                setTimeout(() => {
+                  const el = document.getElementById(`msg-${targetMessageId}`);
+                  if (el) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  }
+                }, 180);
+                setTimeout(() => {
+                  setHighlightedMessageId((curr) => (curr === targetMessageId ? null : curr));
+                }, 3500);
+              }
             }}
           />
         )}

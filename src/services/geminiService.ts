@@ -1,8 +1,8 @@
-import { IntelligenceMode, PersonalityArchetype } from '../types/hologram';
+import { IntelligenceMode, PersonalityArchetype, ChatMessage } from '../types/hologram';
 import { memoryService } from './memoryService';
 import { authService } from './authService';
 
-interface ChatHistoryItem {
+export interface ChatHistoryItem {
   role: 'user' | 'model';
   parts: Array<{ text: string }>;
 }
@@ -139,32 +139,131 @@ class GeminiService {
     image?: VisualAttachment | null,
     maxRetries = 1
   ): Promise<GeminiResponse> {
-    // Explicit user command handling: "Remember that...", "Remember this:...", "Yaad rakhna ki..."
     const trimmedMsg = message.trim();
-    const rememberMatch = trimmedMsg.match(/^(?:please\s+)?(?:remember\s+(?:that|this:?)|yaad\s+rakhna\s*(?:ki|ye|yeh|this)?:?)\s+(.+)$/i);
+
+    // Explicit user memory commands handling
+    // 1. Remember: "Remember that...", "Remember this:...", "Keep in mind that...", "Yaad rakhna ki..."
+    const rememberMatch = trimmedMsg.match(/^(?:please\s+)?(?:remember(?:\s+(?:that|this:?|to|my))?[:\s]+|keep\s+in\s+mind\s+(?:that|this:?|to)?[:\s]+|note\s+(?:that|this:?|down)?[:\s]+|yaad\s+rakhna\s*(?:ki|ye|yeh|this)?[:\s]*)\s*(.+)$/i);
     if (rememberMatch && rememberMatch[1]) {
       const memoryContent = rememberMatch[1].trim();
-      memoryService
-        .saveMemory(memoryContent, 'instruction', 'explicit_user')
-        .then((saved) => {
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent('shadow:memory-saved', { detail: saved }));
-          }
-        })
-        .catch(() => {});
+      const contentLower = memoryContent.toLowerCase();
+      let category: 'preference' | 'project' | 'instruction' | 'constraint' | 'fact' = 'preference';
+      if (/(?:project|app|building|codebase|repo|stack|tool)/i.test(contentLower)) {
+        category = 'project';
+      } else if (/(?:always|never|rule|format|must|don't|do not|keep)/i.test(contentLower)) {
+        category = 'instruction';
+      } else if (/(?:ram|cpu|gb|os|ubuntu|linux|windows|mac|system|hardware|bandwidth)/i.test(contentLower)) {
+        category = 'constraint';
+      } else if (/(?:name is|live in|city|from|work as|profession|engineer|developer)/i.test(contentLower)) {
+        category = 'fact';
+      }
+      try {
+        const saved = await memoryService.saveMemory(memoryContent, category, 'explicit_user');
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('shadow:memory-saved', { detail: saved }));
+        }
+      } catch (err) {
+        console.warn('[SHADOW AI Memory] Failed to save explicit memory:', err);
+      }
     }
 
-    // Retrieve active relevant memories to ground response
+    // 2. Forget: "Forget that...", "Forget about...", "Delete memory about...", "Bhool jao ki..."
+    const forgetMatch = trimmedMsg.match(/^(?:please\s+)?(?:forget(?:\s+(?:that|about|my|everything\s+about))?[:\s]+|delete\s+memory(?:\s+(?:about|regarding|for))?[:\s]+|remove\s+memory(?:\s+(?:about|regarding|for))?[:\s]+|bhool\s+jao\s*(?:ki|ye|yeh|about)?[:\s]*)\s*(.+)$/i);
+    if (forgetMatch && forgetMatch[1]) {
+      const forgetTarget = forgetMatch[1].trim();
+      try {
+        await memoryService.forgetMemoryByQuery(forgetTarget);
+      } catch (err) {
+        console.warn('[SHADOW AI Memory] Failed to process forget command:', err);
+      }
+    }
+
+    // 3. Clear: "Clear all memories", "Wipe memories", "Forget everything", "Saari yaadein mita do"
+    const clearMatch = trimmedMsg.match(/^(?:please\s+)?(?:(?:clear|wipe|delete|reset)\s+(?:all\s+)?(?:my\s+)?memories|forget\s+everything|saari\s+yaadein\s+(?:mita|bhool)\s+do|sab\s+bhool\s+jao)[.!?\s]*$/i);
+    if (clearMatch) {
+      try {
+        await memoryService.clearAllMemories();
+      } catch (err) {
+        console.warn('[SHADOW AI Memory] Failed to process clear all command:', err);
+      }
+    }
+
+    // Retrieve active relevant memories to ground response (reflects any immediate additions/deletions)
     const memoryContext = memoryService.formatContextForPrompt(message);
 
     const payload = {
       message,
-      history: this.history,
+      history: this.history.slice(-20),
       mode,
       personality,
       memoryContext,
       image: image ? { data: image.data, mimeType: image.mimeType, filename: image.filename } : undefined,
     };
+
+    const data = await this.executeChatRequest(payload, maxRetries);
+
+    // Record ONLY real successful user and model turns into memory
+    this.history.push({
+      role: 'user',
+      parts: [{ text: message }],
+    });
+    this.history.push({
+      role: 'model',
+      parts: [{ text: data.reply }],
+    });
+
+    // Limit conversation history to latest 20 turns
+    if (this.history.length > 20) {
+      this.history = this.history.slice(-20);
+    }
+
+    // Asynchronous non-blocking background extraction of long-term memories
+    // Bypasses extraction if user issued an explicit remember, forget, or clear command
+    if (memoryService.isAutoMemoryEnabled() && !rememberMatch && !forgetMatch && !clearMatch) {
+      this.extractLongTermMemoryAsync(message, data.reply);
+    }
+
+    return data;
+  }
+
+  /**
+   * Regenerates a response for a specific prompt using historical conversation context.
+   * Does NOT duplicate memories or append redundant history.
+   */
+  public async regenerateResponse(
+    promptText: string,
+    historyContext: ChatHistoryItem[],
+    mode: IntelligenceMode = 'standard',
+    personality: PersonalityArchetype = 'sci-fi-companion',
+    image?: VisualAttachment | null,
+    maxRetries = 1
+  ): Promise<GeminiResponse> {
+    const memoryContext = memoryService.formatContextForPrompt(promptText);
+
+    // Cap history context to latest 20 turns to prevent exceeding server proxy limits
+    const sanitizedHistory = Array.isArray(historyContext) ? historyContext.slice(-20) : [];
+
+    const payload = {
+      message: promptText,
+      history: sanitizedHistory,
+      mode,
+      personality,
+      memoryContext,
+      image: image ? { data: image.data, mimeType: image.mimeType, filename: image.filename } : undefined,
+    };
+
+    // Execute chat request with historical context without redundant memory re-extraction
+    return await this.executeChatRequest(payload, maxRetries);
+  }
+
+  /**
+   * Core network execution handler for chat completions with retries and diagnostics
+   */
+  private async executeChatRequest(payload: any, maxRetries = 1): Promise<GeminiResponse> {
+    // Defensively ensure history never exceeds the 20-turn context window
+    if (payload && Array.isArray(payload.history) && payload.history.length > 20) {
+      payload.history = payload.history.slice(-20);
+    }
 
     let attempt = 0;
     let lastError: GeminiServiceError | null = null;
@@ -251,26 +350,6 @@ class GeminiService {
           timestamp: new Date().toISOString(),
         };
 
-        // Record ONLY real successful user and model turns into memory
-        this.history.push({
-          role: 'user',
-          parts: [{ text: message }],
-        });
-        this.history.push({
-          role: 'model',
-          parts: [{ text: data.reply }],
-        });
-
-        // Limit conversation history to latest 20 turns
-        if (this.history.length > 20) {
-          this.history = this.history.slice(-20);
-        }
-
-        // Asynchronous non-blocking background extraction of long-term memories
-        if (memoryService.isAutoMemoryEnabled()) {
-          this.extractLongTermMemoryAsync(message, data.reply);
-        }
-
         return data;
       } catch (err: any) {
         if (err instanceof GeminiServiceError) {
@@ -327,6 +406,25 @@ class GeminiService {
 
   public getHistory(): ChatHistoryItem[] {
     return [...this.history];
+  }
+
+  public setHistory(history: ChatHistoryItem[]): void {
+    this.history = [...history].slice(-20);
+  }
+
+  public syncHistoryFromMessages(messages: ChatMessage[]): void {
+    const newHistory: ChatHistoryItem[] = [];
+    for (const msg of messages) {
+      if (msg.isError) continue;
+      const text = msg.text?.trim();
+      if (!text) continue;
+      if (msg.sender === 'user') {
+        newHistory.push({ role: 'user', parts: [{ text }] });
+      } else if (msg.sender === 'shadow') {
+        newHistory.push({ role: 'model', parts: [{ text }] });
+      }
+    }
+    this.history = newHistory.slice(-20);
   }
 
   private async extractLongTermMemoryAsync(userMessage: string, assistantReply: string): Promise<void> {
